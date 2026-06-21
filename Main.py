@@ -203,21 +203,20 @@ def clean_features(X: pd.DataFrame):
     X = X.loc[:, X.std() > 0]
     log.info(f"After NaN/constant removal: {X.shape}")
 
-    # Remove features (columns) whose values contain outliers > 2 SD.
-    # Kirby 2023 drops unstable features, not entire scans — removing rows
-    # with 75+ features almost guarantees half the dataset gets wiped.
-    z                = (X - X.mean()) / X.std()
-    unstable_cols    = z.abs().gt(2).any(axis=0)
-    X_clean          = X.loc[:, ~unstable_cols].copy()
-    log.info(f"Removed {unstable_cols.sum()} unstable features (any value >2 SD) → {X_clean.shape[1]} features")
+    # Winsorize: clip each feature's outlier values to the ±2 SD boundary.
+    # Removing rows or columns both fail on small datasets — winsorizing
+    # preserves all 89 samples while taming extreme values.
+    mean    = X.mean()
+    std     = X.std()
+    X_clean = X.clip(lower=mean - 2 * std, upper=mean + 2 * std, axis=1).copy()
+    log.info(f"Winsorized outlier values (clipped to ±2 SD per feature)")
 
-    corr      = X_clean.corr().abs()
-    upper     = corr.where(np.triu(np.ones(corr.shape, dtype=bool), k=1))
-    to_drop   = [c for c in upper.columns if upper[c].gt(0.90).any()]
-    X_clean   = X_clean.drop(columns=to_drop)
+    corr    = X_clean.corr().abs()
+    upper   = corr.where(np.triu(np.ones(corr.shape, dtype=bool), k=1))
+    to_drop = [c for c in upper.columns if upper[c].gt(0.90).any()]
+    X_clean = X_clean.drop(columns=to_drop)
     log.info(f"Removed {len(to_drop)} correlated features → {X_clean.shape[1]} features remain")
 
-    # No rows removed — return an all-False mask so caller logic is unchanged
     outlier_mask = pd.Series(False, index=X.index)
     return X_clean, outlier_mask
 
