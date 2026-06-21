@@ -1,0 +1,37 @@
+# ── Medical imaging ────────────────────────────────────────────────────────────
+pyradiomics>=3.0.1
+SimpleITK>=2.3.0
+
+# ── ML / numerics ──────────────────────────────────────────────────────────────
+numpy>=1.24.0
+pandas>=2.0.0
+scikit-learn>=1.3.0
+xgboost>=2.0.0
+shap>=0.43.0
+joblib>=1.3.0
+
+# ── API ────────────────────────────────────────────────────────────────────────
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+python-multipart>=0.0.6
+
+# ── Frontend ───────────────────────────────────────────────────────────────────
+streamlit>=1.29.0
+requests>=2.31.0
+
+# ── Visualisation ──────────────────────────────────────────────────────────────
+matplotlib>=3.7.0
+seaborn>=0.13.0
+
+# ── Auto-segmentation (lungmask requires PyTorch) ──────────────────────────────
+# Install separately to control PyTorch flavour (CPU vs CUDA):
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   pip install lungmask
+#
+# Or uncomment below for default (may pull CUDA build):
+# torch>=2.0.0
+# lungmask>=0.2.18
+
+# ── Development ────────────────────────────────────────────────────────────────
+jupyter>=1.0.0
+notebook>=7.0.0

@@ -1,0 +1,20 @@
+# Data (too large for git, not yours to redistribute)
+subset1/
+seg-lungs-LUNA16/
+*.mhd
+*.raw
+*.csv
+!requirements.txt
+
+# Model artifacts and cache
+model/
+features_cache.csv
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
