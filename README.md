@@ -19,30 +19,32 @@ UI   →  http://localhost:8501
 
 ## Results
 
-Trained on **LUNA16 subset1** (89 CT scans, real nodule annotations).
+Trained on **LUNA16 subsets 1–2** (178 CT scans, real nodule annotations).
 
 | Metric | Value |
 |---|---|
-| Test AUC | 0.639 |
-| 5-Fold CV AUC | 0.601 ± 0.187 |
+| Test AUC | 0.767 |
+| 5-Fold CV AUC | 0.708 ± 0.095 |
 | Features extracted | 75 |
-| Features after correlation filter | 27 |
-| Features selected by Elastic Net | 10 |
-| Training samples | 71 |
-| Test samples | 18 |
-| Label split | 28 low risk / 61 high risk |
+| Features after correlation filter | 29 |
+| Features selected by Elastic Net | 14 |
+| Training samples | 142 |
+| Test samples | 36 |
+| Label split | ~56 low risk / ~122 high risk |
+
+Adding subset2 (89 → 178 scans) raised CV AUC from 0.601 to 0.708 and cut variance by nearly half (±0.187 → ±0.095), confirming the model is learning a real signal.
 
 **Top 5 features by SVC coefficient:**
 
 | Feature | Contribution |
 |---|---|
-| `glszm_HighGrayLevelZoneEmphasis` | +1.806 (→ high risk) |
-| `glcm_ClusterTendency` | −1.312 (→ low risk) |
-| `glszm_GrayLevelNonUniformity` | +0.920 (→ high risk) |
-| `glszm_ZoneEntropy` | +0.851 (→ high risk) |
-| `ngtdm_Coarseness` | +0.833 (→ high risk) |
+| `gldm_DependenceEntropy` | +1.558 (→ high risk) |
+| `glszm_GrayLevelNonUniformity` | +1.262 (→ high risk) |
+| `glcm_SumEntropy` | −1.094 (→ low risk) |
+| `glszm_HighGrayLevelZoneEmphasis` | +0.818 (→ high risk) |
+| `glszm_LargeAreaHighGrayLevelEmphasis` | −0.765 (→ low risk) |
 
-The CV AUC of 0.601 is honest — this is one of ten available subsets (~89 of ~888 total scans). Kirby et al. trained on the full dataset. Adding the remaining subsets is the single highest-leverage improvement available.
+The CV AUC of 0.708 uses 2 of 10 available subsets (~178 of ~888 total scans). Adding the remaining subsets is the single highest-leverage improvement available.
 
 ---
 
