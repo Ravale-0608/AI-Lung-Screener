@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Lung Disease Risk Screener — Training Pipeline
 Replicates Kirby et al. 2023: radiomic feature extraction, Elastic Net
@@ -40,9 +39,9 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
-SUBSET_DIR = os.path.join(BASE_DIR, "subset1")
-SEG_DIR    = os.path.join(BASE_DIR, "seg-lungs-LUNA16")
+BASE_DIR     = os.path.dirname(os.path.abspath(__file__))
+SUBSET_DIRS  = sorted(glob.glob(os.path.join(BASE_DIR, "subset*")))  # auto-detects subset1, subset2, …
+SEG_DIR      = os.path.join(BASE_DIR, "seg-lungs-LUNA16")
 MODEL_DIR  = os.path.join(BASE_DIR, "model")
 CACHE_CSV  = os.path.join(BASE_DIR, "features_cache.csv")
 
@@ -51,7 +50,7 @@ CANDIDATES_CSV  = os.path.join(BASE_DIR, "candidates.csv")
 
 os.makedirs(MODEL_DIR, exist_ok=True)
 
-# ── PyRadiomics configuration (Kirby 2023 feature sets) ───────────────────────
+#  PyRadiomics configuration (Kirby 2023 feature sets) 
 EXTRACTOR_PARAMS = {
     "imageType": {"Original": {}},
     "featureClass": {
@@ -70,7 +69,7 @@ EXTRACTOR_PARAMS = {
 }
 
 
-# ── Feature extraction ─────────────────────────────────────────────────────────
+#  Feature extraction 
 
 def build_extractor():
     extractor = featureextractor.RadiomicsFeatureExtractor(**EXTRACTOR_PARAMS)
@@ -80,11 +79,19 @@ def build_extractor():
     return extractor
 
 
-def extract_scan(series_uid: str, extractor) -> dict | None:
-    ct_path   = os.path.join(SUBSET_DIR, f"{series_uid}.mhd")
-    mask_path = os.path.join(SEG_DIR,    f"{series_uid}.mhd")
+def find_ct_path(series_uid: str) -> str | None:
+    for d in SUBSET_DIRS:
+        p = os.path.join(d, f"{series_uid}.mhd")
+        if os.path.exists(p):
+            return p
+    return None
 
-    if not os.path.exists(ct_path) or not os.path.exists(mask_path):
+
+def extract_scan(series_uid: str, extractor) -> dict | None:
+    ct_path   = find_ct_path(series_uid)
+    mask_path = os.path.join(SEG_DIR, f"{series_uid}.mhd")
+
+    if ct_path is None or not os.path.exists(mask_path):
         return None
 
     try:
@@ -120,14 +127,14 @@ def extract_all_features(limit: int | None = None) -> pd.DataFrame:
     log.info("Building PyRadiomics extractor (first run may download models)…")
     extractor = build_extractor()
 
-    ct_files    = glob.glob(os.path.join(SUBSET_DIR, "*.mhd"))
+    ct_files    = [f for d in SUBSET_DIRS for f in glob.glob(os.path.join(d, "*.mhd"))]
     series_uids = [os.path.splitext(os.path.basename(f))[0] for f in ct_files]
 
     if limit:
         series_uids = series_uids[:limit]
         log.info(f"Development mode: processing {limit} scans")
 
-    log.info(f"Found {len(series_uids)} CT scans in subset1/")
+    log.info(f"Found {len(series_uids)} CT scans across {[os.path.basename(d) for d in SUBSET_DIRS]}")
     log.info("⚠  Extraction is slow (~2–10 min per scan). Go make tea.")
 
     records = []
@@ -143,7 +150,7 @@ def extract_all_features(limit: int | None = None) -> pd.DataFrame:
     return df
 
 
-# ── Label creation ─────────────────────────────────────────────────────────────
+#  Label creation ─────────────────────────────────────────────────────────────
 
 def create_labels(df: pd.DataFrame, demo: bool = False) -> pd.DataFrame:
     """
@@ -188,7 +195,7 @@ def create_labels(df: pd.DataFrame, demo: bool = False) -> pd.DataFrame:
     return df
 
 
-# ── Data cleaning (Kirby 2023 method) ─────────────────────────────────────────
+#  Data cleaning (Kirby 2023 method) 
 
 def clean_features(X: pd.DataFrame):
     """
@@ -221,7 +228,7 @@ def clean_features(X: pd.DataFrame):
     return X_clean, outlier_mask
 
 
-# ── Model training ─────────────────────────────────────────────────────────────
+#  Model training 
 
 def train(X_train, y_train, X_test, y_test):
     """
