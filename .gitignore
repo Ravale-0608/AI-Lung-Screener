@@ -8,7 +8,8 @@ seg-lungs-LUNA16/
 
 # Model artifacts and cache
 model/
-features_cache.csv
+features_cache*.csv
+baselines_cache.csv
 
 # Python
 .venv/

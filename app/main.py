@@ -1,9 +1,9 @@
 """
-Lung Risk Screener — FastAPI Backend
+Lung Nodule Screener — FastAPI Backend
 
 Endpoints:
   POST /predict   Upload a CT scan (.mhd / .nrrd / .nii / .nii.gz)
-                  Returns: risk_score, risk_level, top_features
+                  Returns: nodule_probability, nodule_likelihood, top_features
   GET  /health    Liveness probe
   GET  /stats     Training statistics
 
@@ -11,7 +11,7 @@ Auto-segmentation: lungmask (JoHof U-Net) generates the lung mask
 automatically — no pre-computed mask required at inference time.
 
 Start with:
-  uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+  python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 """
 
 import io
@@ -22,12 +22,14 @@ import shutil
 import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import pandas as pd
 import SimpleITK as sitk
 import joblib
+
+from sklearn import set_config
+set_config(transform_output="pandas")
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -61,8 +63,6 @@ EXTRACTOR_PARAMS = {
     },
 }
 
-# ── App state (loaded once at startup) ────────────────────────────────────────
-
 state: dict = {}
 
 
@@ -88,15 +88,14 @@ def _load_model():
     log.info("Model and extractor loaded successfully.")
 
 
-# ── FastAPI app ────────────────────────────────────────────────────────────────
-
 app = FastAPI(
-    title="Lung Risk Screener API",
+    title="Lung Nodule Screener API",
     description=(
-        "COPD/nodule risk scoring from CT scans. "
-        "Elastic Net feature selection + Linear SVM on LUNA16 radiomic features."
+        "Pulmonary nodule detection from CT scans. "
+        "Elastic Net feature selection + Linear SVM on LUNA16 radiomic features. "
+        "Research use only — not for clinical decisions."
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -113,13 +112,13 @@ app.add_middleware(
 def auto_segment(image: sitk.Image) -> sitk.Image:
     """
     Use lungmask (JoHof R231 U-Net) to generate a whole-lung binary mask.
-    Falls back to a simple HU-threshold mask if lungmask is not installed.
+    Falls back to an HU-threshold mask if lungmask is not installed.
     """
     try:
         from lungmask import LMInferer
-        inferer     = LMInferer()
-        seg_array   = inferer.apply(image)                    # 0=bg, 1=right, 2=left
-        combined    = (seg_array > 0).astype(np.int16)
+        inferer   = LMInferer()
+        seg_array = inferer.apply(image)
+        combined  = (seg_array > 0).astype(np.int16)
     except ImportError:
         log.warning("lungmask not installed — using HU threshold fallback.")
         arr      = sitk.GetArrayFromImage(image).astype(np.float32)
@@ -138,46 +137,44 @@ def extract_features_from_image(
     extractor,
     feature_names: list[str],
 ) -> pd.DataFrame:
-    """Extract radiomic features and align to the training feature set."""
-    mask = sitk.Cast(mask, sitk.sitkInt32)
+    """
+    Extract radiomic features and align to the full raw feature set used during
+    training. Missing features are filled with 0.0; the pipeline's NaNDropper
+    and CorrelationFilter handle any further cleaning at inference time.
+    """
+    mask   = sitk.Cast(mask, sitk.sitkInt32)
     result = extractor.execute(image, mask)
-    raw = {k: float(v) for k, v in result.items() if k.startswith("original_")}
-
-    # Align to training features: fill missing with 0 (will be handled by scaler)
-    row = {f: raw.get(f, 0.0) for f in feature_names}
+    raw    = {k: float(v) for k, v in result.items() if k.startswith("original_")}
+    row    = {f: raw.get(f, 0.0) for f in feature_names}
     return pd.DataFrame([row])
 
 
 # ── Feature importance for the prediction ─────────────────────────────────────
 
-def get_top_features(
-    pipeline,
-    X: pd.DataFrame,
-    feature_names: list[str],
-    n: int = 5,
-) -> dict:
+def get_top_features(pipeline, X: pd.DataFrame, n: int = 5) -> dict:
     """
-    Compute per-instance feature contributions using Linear SVC coefficients
-    (coef * scaled_value → signed contribution, fast alternative to SHAP).
+    Per-instance feature contributions: SVC coefficient × scaled feature value.
+    Uses the full pipeline's selector output so contributions are in the same
+    space as the classifier's decision boundary.
     """
-    scaler      = pipeline.named_steps["scaler"]
-    selector    = pipeline.named_steps["selector"]
-    clf         = pipeline.named_steps["clf"]
+    selector = pipeline.named_steps["selector"]
+    clf      = pipeline.named_steps["clf"]
 
-    X_scaled    = scaler.transform(X)
-    selected_ix = selector.get_support(indices=True)
-    coefs       = clf.coef_[0]
+    # pipeline[:-1] = all steps except clf; output shape (1, n_selected)
+    X_sel = pipeline[:-1].transform(X)
+    names = selector.get_feature_names_out()
+    coefs = clf.coef_[0]
 
     contributions = {
-        feature_names[ix]: float(coefs[j] * X_scaled[0, ix])
-        for j, ix in enumerate(selected_ix)
+        name: float(coefs[j] * X_sel.values[0, j])
+        for j, name in enumerate(names)
     }
     top = dict(sorted(contributions.items(), key=lambda x: abs(x[1]), reverse=True)[:n])
-    # Readable feature name: strip "original_" prefix and class prefix
     return {
-        k.replace("original_", "").replace("glcm_", "glcm·")
-         .replace("glrlm_", "glrlm·").replace("glszm_", "glszm·")
-         .replace("gldm_", "gldm·").replace("ngtdm_", "ngtdm·"): round(v, 4)
+        k.replace("original_", "")
+         .replace("glcm_",  "glcm·").replace("glrlm_", "glrlm·")
+         .replace("glszm_", "glszm·").replace("gldm_",  "gldm·")
+         .replace("ngtdm_", "ngtdm·"): round(v, 4)
         for k, v in top.items()
     }
 
@@ -201,23 +198,22 @@ async def predict(file: UploadFile = File(...)):
     """
     Upload a CT scan file (.mhd, .nrrd, .nii, .nii.gz).
     Note: .mhd files require a companion .raw file — prefer .nrrd for uploads.
-    Returns risk_score (0–1), risk_level, and top 5 contributing features.
+    Returns nodule_probability (0–1), nodule_likelihood (Low/Moderate/High),
+    and top 5 contributing radiomic features.
+    Research use only — not for clinical decisions.
     """
     if "pipeline" not in state:
         raise HTTPException(
-            503,
-            "Model not loaded. Train the model first: python Main.py"
+            503, "Model not loaded. Train the model first: python Main.py"
         )
 
-    suffix = Path(file.filename).suffix.lower()
+    suffix  = Path(file.filename).suffix.lower()
     allowed = {".mhd", ".nrrd", ".nii", ".gz"}
     if suffix not in allowed:
         raise HTTPException(
-            400,
-            f"Unsupported format '{suffix}'. Use .nrrd, .nii, .nii.gz, or .mhd"
+            400, f"Unsupported format '{suffix}'. Use .nrrd, .nii, .nii.gz, or .mhd"
         )
 
-    # Save upload to a temp file so SimpleITK can read it
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_path = os.path.join(tmpdir, file.filename)
         content  = await file.read()
@@ -236,10 +232,7 @@ async def predict(file: UploadFile = File(...)):
 
         try:
             X = extract_features_from_image(
-                image,
-                mask,
-                state["extractor"],
-                state["feature_names"],
+                image, mask, state["extractor"], state["feature_names"]
             )
         except Exception as exc:
             raise HTTPException(500, f"Feature extraction failed: {exc}")
@@ -247,21 +240,21 @@ async def predict(file: UploadFile = File(...)):
     pipeline = state["pipeline"]
 
     try:
-        risk_score  = float(pipeline.predict_proba(X)[0, 1])
-        top_feats   = get_top_features(pipeline, X, state["feature_names"])
+        nodule_probability = float(pipeline.predict_proba(X)[0, 1])
+        top_feats          = get_top_features(pipeline, X)
     except Exception as exc:
         raise HTTPException(500, f"Prediction failed: {exc}")
 
-    if risk_score < 0.3:
-        risk_level = "Low"
-    elif risk_score < 0.6:
-        risk_level = "Moderate"
+    if nodule_probability < 0.3:
+        nodule_likelihood = "Low"
+    elif nodule_probability < 0.6:
+        nodule_likelihood = "Moderate"
     else:
-        risk_level = "High"
+        nodule_likelihood = "High"
 
     return JSONResponse({
-        "risk_score":   round(risk_score, 3),
-        "risk_level":   risk_level,
-        "top_features": top_feats,
-        "methodology":  "Elastic Net feature selection + Linear SVM",
+        "nodule_probability": round(nodule_probability, 3),
+        "nodule_likelihood":  nodule_likelihood,
+        "top_features":       top_feats,
+        "methodology":        "Elastic Net feature selection + Linear SVM (LUNA16)",
     })

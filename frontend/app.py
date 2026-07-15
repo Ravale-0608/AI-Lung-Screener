@@ -1,11 +1,11 @@
 """
-Lung Risk Screener — Streamlit Frontend
+Lung Nodule Screener — Streamlit Frontend
 
 Start with:
-  streamlit run frontend/app.py
+  python -m streamlit run frontend/app.py
 
 The API must be running first:
-  uvicorn app.main:app --reload --port 8000
+  python -m uvicorn app.main:app --reload --port 8000
 """
 
 import json
@@ -19,17 +19,23 @@ API_URL = os.getenv("API_URL", "http://localhost:8000")
 # ── Page config ────────────────────────────────────────────────────────────────
 
 st.set_page_config(
-    page_title="Lung Risk Screener",
+    page_title="Lung Nodule Screener",
     page_icon="🫁",
     layout="centered",
 )
 
 # ── Header ─────────────────────────────────────────────────────────────────────
 
-st.title("Lung Disease Risk Screener")
+st.title("Lung Nodule Screener")
 st.caption(
-    "Radiomic feature extraction · Elastic Net + Linear SVM · "
     "Radiomic feature extraction · Elastic Net + Linear SVM · LUNA16"
+)
+st.warning(
+    "**Research tool only — not for clinical use.** "
+    "This model was trained on LUNA16 CT scans to detect pulmonary nodules. "
+    "It has not been validated for clinical decision-making. "
+    "Consult a qualified radiologist for any clinical assessment.",
+    icon="⚠️",
 )
 st.divider()
 
@@ -40,22 +46,25 @@ with st.sidebar:
     try:
         resp  = requests.get(f"{API_URL}/stats", timeout=3)
         stats = resp.json()
-        st.metric("Test AUC",  f"{stats.get('test_auc', 'N/A'):.3f}")
-        st.metric("CV AUC",    f"{stats.get('cv_auc_mean', 'N/A'):.3f} ± {stats.get('cv_auc_std', 'N/A'):.3f}")
+        ci_lo = stats.get("test_auc_ci_lo", "")
+        ci_hi = stats.get("test_auc_ci_hi", "")
+        ci_str = f"  (95% CI {ci_lo:.3f}–{ci_hi:.3f})" if ci_lo and ci_hi else ""
+        st.metric("Test AUC",  f"{stats.get('test_auc', 'N/A'):.3f}{ci_str}")
+        st.metric("CV AUC",
+                  f"{stats.get('cv_auc_mean', 'N/A'):.3f} ± {stats.get('cv_auc_std', 'N/A'):.3f}")
         st.metric("Features (selected)",  stats.get("n_features_selected", "N/A"))
         st.metric("Training samples",     stats.get("n_train", "N/A"))
     except Exception:
         st.warning("API offline — start the backend first.")
-        st.code("uvicorn app.main:app --reload")
+        st.code("python -m uvicorn app.main:app --reload")
 
     st.divider()
     st.subheader("Methodology")
     st.markdown(
-        "Features extracted using **PyRadiomics** (GLCM, GLRLM, GLSZM, GLDM, NGTDM). "
-        "Cleaning: outliers >2 SD removed, correlated features (r>0.90) dropped. "
-        "Selection: **Elastic Net** regression (α=0.01, l₁=0.5). "
-        "Classifier: **Linear SVM**. "
-        ""
+        "Features extracted using **PyRadiomics** (GLCM, GLRLM, GLSZM, GLDM, NGTDM — 75 total). "
+        "Cleaning: winsorize ±2 SD, drop correlated features (r>0.90). "
+        "Selection: **Elastic Net** (α=0.01, L1=0.5). "
+        "Classifier: **Linear SVM**."
     )
 
 # ── Upload panel ───────────────────────────────────────────────────────────────
@@ -63,7 +72,7 @@ with st.sidebar:
 st.subheader("Upload CT Scan")
 st.markdown(
     "Upload a lung CT scan in **.nrrd**, **.nii**, **.nii.gz**, or **.mhd** format. "
-    "The model auto-segments the lung and returns a risk score."
+    "The model auto-segments the lung and returns a nodule probability."
 )
 
 uploaded = st.file_uploader(
@@ -73,7 +82,7 @@ uploaded = st.file_uploader(
 )
 
 if uploaded is None:
-    st.info("Upload a CT scan above to get a risk prediction.")
+    st.info("Upload a CT scan above to get a nodule prediction.")
     st.stop()
 
 # ── Prediction ─────────────────────────────────────────────────────────────────
@@ -83,12 +92,12 @@ with st.spinner("Segmenting lungs and extracting radiomic features…"):
         response = requests.post(
             f"{API_URL}/predict",
             files={"file": (uploaded.name, uploaded.getvalue(), "application/octet-stream")},
-            timeout=300,   # feature extraction can take a few minutes
+            timeout=300,
         )
     except requests.exceptions.ConnectionError:
         st.error(
             "Cannot reach the API. Make sure the backend is running:\n\n"
-            "```\nuvicorn app.main:app --reload\n```"
+            "```\npython -m uvicorn app.main:app --reload\n```"
         )
         st.stop()
 
@@ -104,20 +113,18 @@ result = response.json()
 st.divider()
 st.subheader("Prediction Result")
 
-score = result["risk_score"]
-level = result["risk_level"]
+score      = result["nodule_probability"]
+likelihood = result["nodule_likelihood"]
 
 colour_map = {"Low": "🟢", "Moderate": "🟡", "High": "🔴"}
-icon       = colour_map.get(level, "⚪")
+icon       = colour_map.get(likelihood, "⚪")
 
 col1, col2 = st.columns(2)
 with col1:
-    st.metric(f"{icon}  Risk Level", level)
+    st.metric(f"{icon}  Nodule Likelihood", likelihood)
 with col2:
-    st.metric("Risk Score", f"{score:.1%}")
+    st.metric("Nodule Probability", f"{score:.1%}")
 
-# Progress bar as visual indicator
-bar_colour = {"Low": "green", "Moderate": "orange", "High": "red"}.get(level, "gray")
 st.progress(score, text=f"Score: {score:.3f}")
 
 # ── Feature importance chart ───────────────────────────────────────────────────
@@ -128,7 +135,7 @@ if top_feats:
     st.subheader("Top Contributing Features")
     st.caption(
         "Feature contributions = SVC coefficient × scaled feature value. "
-        "Positive → pushes toward high risk; negative → toward low risk."
+        "Positive → pushes toward nodule-present; negative → toward nodule-absent."
     )
 
     import pandas as pd
@@ -138,12 +145,3 @@ if top_feats:
         .set_index("Feature")
     )
     st.bar_chart(feat_df)
-
-# ── Disclaimer ────────────────────────────────────────────────────────────────
-
-st.divider()
-st.caption(
-    "⚠️  **Research tool only — not for clinical use.**  "
-    "This model was trained on LUNA16 CT scans. "
-    "Consult a qualified radiologist for clinical decisions."
-)
