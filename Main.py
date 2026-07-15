@@ -36,7 +36,7 @@ from sklearn.svm import SVC
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import (
-    train_test_split, StratifiedKFold, cross_val_score,
+    train_test_split, StratifiedKFold, GroupKFold, cross_val_score,
 )
 from sklearn.metrics import roc_auc_score, classification_report
 from radiomics import featureextractor
@@ -77,7 +77,6 @@ EXTRACTOR_PARAMS = {
     },
 }
 
-# Cache keyed to EXTRACTOR_PARAMS so changing params forces re-extraction
 _params_hash    = hashlib.md5(
     json.dumps(EXTRACTOR_PARAMS, sort_keys=True).encode()
 ).hexdigest()[:8]
@@ -86,8 +85,7 @@ BASELINES_CACHE = os.path.join(BASE_DIR, "baselines_cache.csv")
 
 
 # ── Custom sklearn transformers ────────────────────────────────────────────────
-# All three live INSIDE the Pipeline so their fit() runs only on the training
-# fold → no leakage of test-set statistics into cleaning or feature selection.
+# All three are inside the Pipeline so fit() sees only the training fold.
 
 class NaNDropper(BaseEstimator, TransformerMixin):
     """Drop features with any NaN/Inf or zero variance (fitted on train only)."""
@@ -156,8 +154,12 @@ class CorrelationFilter(BaseEstimator, TransformerMixin):
         return np.array(self.cols_to_keep_)
 
 
-def build_pipeline(max_features=None, threshold="mean") -> Pipeline:
-    """Build the full cleaning + classification pipeline."""
+def build_pipeline(max_features=None, threshold="mean", probability=False) -> Pipeline:
+    """
+    Build the full cleaning + classification pipeline.
+    probability=False (default) skips Platt scaling — use for CV.
+    probability=True for the final saved model so the API can call predict_proba.
+    """
     if max_features is not None:
         sel = SelectFromModel(
             ElasticNet(alpha=0.01, l1_ratio=0.5, max_iter=5000),
@@ -175,7 +177,7 @@ def build_pipeline(max_features=None, threshold="mean") -> Pipeline:
         ("corr_filter", CorrelationFilter(threshold=0.90)),
         ("scaler",      StandardScaler()),
         ("selector",    sel),
-        ("clf",         SVC(kernel="linear", probability=True, C=1.0)),
+        ("clf",         SVC(kernel="linear", probability=probability, C=1.0)),
     ])
 
 
@@ -209,7 +211,7 @@ def extract_scan(series_uid: str, extractor) -> dict | None:
         mask  = sitk.ReadImage(mask_path)
 
         # LUNA16 masks use labels 3 (right lung) and 4 (left lung).
-        # Binarize to label=1 so PyRadiomics sees a single combined region.
+        # Binarize to label=1 covering both lungs.
         arr    = sitk.GetArrayFromImage(mask)
         binary = (arr > 0).astype(np.int16)
         mask   = sitk.GetImageFromArray(binary)
@@ -226,7 +228,6 @@ def extract_scan(series_uid: str, extractor) -> dict | None:
 
 
 def extract_all_features(limit: int | None = None) -> pd.DataFrame:
-    # Migrate old unkeyed cache so existing extractions are not lost
     old_cache = os.path.join(BASE_DIR, "features_cache.csv")
     if not os.path.exists(CACHE_CSV) and os.path.exists(old_cache):
         shutil.copy(old_cache, CACHE_CSV)
@@ -269,7 +270,7 @@ def extract_all_features(limit: int | None = None) -> pd.DataFrame:
 
 def create_labels(df: pd.DataFrame, demo: bool = False) -> pd.DataFrame:
     """
-    Labels: 1 = nodule present (scan has ≥1 confirmed LUNA16 annotation),
+    Labels: 1 = nodule present (scan has ≥1 confirmed LUNA16 annotation ≥3 mm),
             0 = nodule absent.
     Source priority: annotations.csv > candidates.csv > synthetic demo labels.
     """
@@ -330,7 +331,7 @@ def read_scan_spacing(series_uid: str) -> dict | None:
         reader = sitk.ImageFileReader()
         reader.SetFileName(ct_path)
         reader.ReadImageInformation()
-        sp = reader.GetSpacing()  # (x_mm, y_mm, z_mm)
+        sp = reader.GetSpacing()
         return {
             "series_uid": series_uid,
             "spacing_x":  sp[0],
@@ -343,11 +344,11 @@ def read_scan_spacing(series_uid: str) -> dict | None:
 
 def check_spacing_confound(series_uids: pd.Series, y: pd.Series) -> dict:
     """
-    Read slice thickness (spacing_z) and in-plane spacing from .mhd headers
-    and report AUC of each spacing axis predicting the nodule label.
-    AUC > 0.65 suggests acquisition differences confound the label.
-    LUNA16 subsets are random CV splits, NOT acquisition sites — do not treat
-    subset membership as a site proxy.
+    Report raw AUC of each spacing axis predicting the nodule label.
+    AUC is NOT flipped: a value below 0.5 means the predictor anti-correlates
+    with the label (high spacing → fewer nodules). The null expectation is
+    AUC ≈ 0.50; deviation > 0.15 in either direction is flagged.
+    LUNA16 subsets are random CV splits, not acquisition sites.
     """
     log.info("\nReading scan spacings from .mhd headers…")
     rows = []
@@ -364,88 +365,181 @@ def check_spacing_confound(series_uids: pd.Series, y: pd.Series) -> dict:
     sp_df   = pd.DataFrame(rows)
     results = {}
     for col in ["spacing_x", "spacing_y", "spacing_z"]:
-        auc = roc_auc_score(sp_df["label"], sp_df[col])
-        auc = max(auc, 1 - auc)   # flip so always ≥ 0.5
+        auc  = roc_auc_score(sp_df["label"], sp_df[col])
+        flag = "  ← deviates from null" if abs(auc - 0.5) > 0.15 else ""
         results[col] = round(auc, 3)
-        log.info(f"  Spacing confound AUC ({col}): {results[col]:.3f}")
+        log.info(f"  {col} AUC: {results[col]:.3f}  (null ≈ 0.50){flag}")
 
-    if results.get("spacing_z", 0) > 0.65:
-        log.warning(
-            f"  spacing_z AUC={results['spacing_z']:.3f} > 0.65 — "
-            "slice thickness correlates with nodule label; GroupKFold recommended."
-        )
     return results
 
 
-def compute_baselines(series_uids: pd.Series, y: pd.Series) -> dict:
+def run_spacing_group_cv(
+    X: pd.DataFrame, y: pd.Series, series_uids: pd.Series, n_bins: int = 5
+) -> dict:
     """
-    Compute per-scan lung volume (mL) and emphysema density fraction
-    (% voxels < −950 HU within the lung mask) as simple non-radiomic baselines.
-    Cached to baselines_cache.csv to avoid repeated image loading.
+    Re-run CV using GroupKFold on binned spacing_z. Each fold's test set
+    contains a different slice-thickness bin from the training folds.
+    Per-fold try/except handles single-class test folds (common with small n
+    and correlated spacing).
+    """
+    log.info("\nGroupKFold CV on binned spacing_z…")
+    rows = []
+    for uid, idx in zip(series_uids.values, X.index):
+        sp = read_scan_spacing(uid)
+        if sp is not None:
+            rows.append({"orig_idx": idx, "spacing_z": sp["spacing_z"]})
+
+    if not rows:
+        log.warning("  No spacing data — skipping GroupKFold.")
+        return {}
+
+    sp_df   = pd.DataFrame(rows).set_index("orig_idx")
+    valid   = sp_df.index.intersection(X.index)
+    X_sub   = X.loc[valid].reset_index(drop=True)
+    y_sub   = y.loc[valid].reset_index(drop=True)
+    sp_vals = sp_df.loc[valid, "spacing_z"].values
+
+    # Integer bin codes; duplicates="drop" merges ties
+    cut = pd.qcut(sp_vals, q=n_bins, labels=False, duplicates="drop")
+    # pd.qcut may return a Categorical; coerce to nullable then to int
+    groups   = pd.array(cut, dtype="Int64").to_numpy(dtype=float, na_value=np.nan)
+    not_nan  = ~np.isnan(groups)
+    groups   = groups[not_nan].astype(int)
+    X_sub    = X_sub.iloc[not_nan].reset_index(drop=True)
+    y_sub    = y_sub.iloc[not_nan].reset_index(drop=True)
+
+    n_actual = len(np.unique(groups))
+    if n_actual < 2:
+        log.warning("  Not enough distinct spacing groups — skipping GroupKFold.")
+        return {}
+
+    gkf         = GroupKFold(n_splits=n_actual)
+    fold_scores = []
+    for tr_idx, te_idx in gkf.split(X_sub, y_sub, groups=groups):
+        try:
+            p = build_pipeline()   # probability=False — no Platt scaling
+            p.fit(X_sub.iloc[tr_idx], y_sub.iloc[tr_idx])
+            score = roc_auc_score(
+                y_sub.iloc[te_idx],
+                p.decision_function(X_sub.iloc[te_idx]),
+            )
+            fold_scores.append(score)
+        except ValueError:
+            log.warning("  Skipped fold (single-class test set)")
+            fold_scores.append(np.nan)
+
+    valid_scores = [s for s in fold_scores if not np.isnan(s)]
+    if not valid_scores:
+        log.warning(
+            f"  All {len(fold_scores)} GroupKFold folds failed (single-class test folds). "
+            "This indicates the spacing_z bins are strongly correlated with the label."
+        )
+        return {
+            "mean": None, "std": None,
+            "n_bins": n_actual, "n": len(X_sub), "n_valid_folds": 0,
+        }
+
+    mean_auc = float(np.mean(valid_scores))
+    std_auc  = float(np.std(valid_scores))
+    log.info(
+        f"  GroupKFold (spacing_z, {n_actual} bins) CV AUC: "
+        f"{mean_auc:.3f} ± {std_auc:.3f}  "
+        f"({len(valid_scores)}/{len(fold_scores)} valid folds, n={len(X_sub)})"
+    )
+    return {
+        "mean":          round(mean_auc, 3),
+        "std":           round(std_auc,  3),
+        "n_bins":        n_actual,
+        "n":             len(X_sub),
+        "n_valid_folds": len(valid_scores),
+    }
+
+
+def compute_baseline_measurements(series_uids: pd.Series) -> pd.DataFrame:
+    """
+    Load or compute per-scan lung volume (mL) and emphysema density fraction
+    (% voxels < −950 HU within the lung mask). Results are cached.
     """
     if os.path.exists(BASELINES_CACHE):
         log.info(f"Loading cached baselines from {BASELINES_CACHE}")
-        df = pd.read_csv(BASELINES_CACHE)
-    else:
-        log.info("Computing baselines (reading CT images and masks) — this takes a few minutes…")
-        records = []
-        for i, uid in enumerate(series_uids, 1):
-            ct_path   = find_ct_path(uid)
-            mask_path = os.path.join(SEG_DIR, f"{uid}.mhd")
-            if ct_path is None or not os.path.exists(mask_path):
-                continue
-            try:
-                image = sitk.ReadImage(ct_path)
-                mask  = sitk.ReadImage(mask_path)
-                arr   = sitk.GetArrayFromImage(image).astype(np.float32)
-                marr  = sitk.GetArrayFromImage(mask)
-                lung  = (marr > 0)
-                sp    = image.GetSpacing()
-                vox   = sp[0] * sp[1] * sp[2]
-                n_l   = int(lung.sum())
-                n_e   = int(((arr < -950) & lung).sum())
-                records.append({
-                    "series_uid":     uid,
-                    "lung_volume_ml": float(n_l * vox / 1000),
-                    "emphysema_frac": float(n_e / max(n_l, 1)),
-                })
-                if i % 20 == 0:
-                    log.info(f"  [{i}/{len(series_uids)}] baselines done")
-            except Exception as exc:
-                log.warning(f"  Baseline skipped {uid[:40]}: {exc}")
-        df = pd.DataFrame(records)
-        df.to_csv(BASELINES_CACHE, index=False)
-        log.info(f"Saved baselines → {BASELINES_CACHE}")
+        return pd.read_csv(BASELINES_CACHE)
 
+    log.info("Computing baselines (reading CT images and masks)…")
+    records = []
+    for i, uid in enumerate(series_uids, 1):
+        ct_path   = find_ct_path(uid)
+        mask_path = os.path.join(SEG_DIR, f"{uid}.mhd")
+        if ct_path is None or not os.path.exists(mask_path):
+            continue
+        try:
+            image = sitk.ReadImage(ct_path)
+            mask  = sitk.ReadImage(mask_path)
+            arr   = sitk.GetArrayFromImage(image).astype(np.float32)
+            marr  = sitk.GetArrayFromImage(mask)
+            lung  = (marr > 0)
+            sp    = image.GetSpacing()
+            vox   = sp[0] * sp[1] * sp[2]
+            n_l   = int(lung.sum())
+            n_e   = int(((arr < -950) & lung).sum())
+            records.append({
+                "series_uid":     uid,
+                "lung_volume_ml": float(n_l * vox / 1000),
+                "emphysema_frac": float(n_e / max(n_l, 1)),
+            })
+            if i % 20 == 0:
+                log.info(f"  [{i}/{len(series_uids)}] done")
+        except Exception as exc:
+            log.warning(f"  Baseline skipped {uid[:40]}: {exc}")
+
+    df = pd.DataFrame(records)
+    df.to_csv(BASELINES_CACHE, index=False)
+    log.info(f"Saved baselines → {BASELINES_CACHE}")
+    return df
+
+
+def evaluate_baselines(
+    measurements: pd.DataFrame, series_uids: pd.Series, y: pd.Series
+) -> dict:
+    """
+    Compute raw AUC of lung-volume and emphysema fraction vs labels for the
+    given scan set. AUC is NOT flipped — values below 0.5 mean the predictor
+    anti-correlates with the label. Null expectation is AUC ≈ 0.50.
+    Evaluated on the same split as the model (series_uids and y must match).
+    """
     uid_to_label = dict(zip(series_uids.values, y.values))
-    df["label"]  = df["series_uid"].map(uid_to_label)
-    df           = df.dropna(subset=["label"])
+    df = measurements.copy()
+    df["label"] = df["series_uid"].map(uid_to_label)
+    df = df.dropna(subset=["label"])
 
     aucs = {}
     for col in ["lung_volume_ml", "emphysema_frac"]:
-        a = roc_auc_score(df["label"], df[col])
-        a = max(a, 1 - a)
-        aucs[col] = round(a, 3)
-        log.info(f"  Baseline AUC ({col}): {aucs[col]:.3f}")
+        auc = roc_auc_score(df["label"], df[col])
+        aucs[col] = round(auc, 3)
+        log.info(f"  Baseline AUC ({col}): {aucs[col]:.3f}  (null ≈ 0.50, n={len(df)})")
     return aucs
 
 
-def compare_feature_counts(X: pd.DataFrame, y: pd.Series, cv) -> dict:
-    """Compare 5-fold CV AUC for three SelectFromModel configurations."""
-    log.info("\nFeature-count comparison (5-fold CV AUC):")
+def compare_feature_counts(
+    X_tr: pd.DataFrame, y_tr: pd.Series,
+    X_te: pd.DataFrame, y_te: pd.Series,
+) -> dict:
+    """
+    Fit each SelectFromModel configuration on the training split only and
+    evaluate test-set AUC on the held-out test split (same split as the main model).
+    """
+    log.info("\nFeature-count comparison (same train/test split as main model):")
     results = {}
     for label, kw in [
         ("max_5",  {"max_features": 5}),
         ("max_10", {"max_features": 10}),
         ("mean",   {}),
     ]:
-        p      = build_pipeline(**kw)
-        scores = cross_val_score(p, X, y, cv=cv, scoring="roc_auc")
-        results[label] = {
-            "mean": round(float(scores.mean()), 3),
-            "std":  round(float(scores.std()),  3),
-        }
-        log.info(f"  {label:7s}: {scores.mean():.3f} ± {scores.std():.3f}")
+        p = build_pipeline(**kw)   # probability=False — no Platt scaling
+        p.fit(X_tr, y_tr)
+        y_score = p.decision_function(X_te)
+        auc     = roc_auc_score(y_te, y_score)
+        results[label] = {"test_auc": round(auc, 3)}
+        log.info(f"  {label:7s}: test AUC = {auc:.3f}")
     return results
 
 
@@ -453,7 +547,8 @@ def compare_feature_counts(X: pd.DataFrame, y: pd.Series, cv) -> dict:
 
 def train(X_tr: pd.DataFrame, y_tr: pd.Series,
           X_te: pd.DataFrame, y_te: pd.Series):
-    pipeline = build_pipeline()
+    # Final model: probability=True so the API can call predict_proba
+    pipeline = build_pipeline(probability=True)
     log.info(
         "\nFitting pipeline: "
         "NaNDropper → Winsorizer → CorrelationFilter → StandardScaler "
@@ -461,16 +556,14 @@ def train(X_tr: pd.DataFrame, y_tr: pd.Series,
     )
     pipeline.fit(X_tr, y_tr)
 
-    # AUC via decision_function — more stable than predict_proba (Platt scaling)
-    # on small test sets. predict_proba is kept for the API's probability output.
     y_score = pipeline.decision_function(X_te)
     y_pred  = pipeline.predict(X_te)
     auc     = roc_auc_score(y_te, y_score)
     ci_lo, ci_hi = bootstrap_auc_ci(y_te, y_score)
 
-    n_kept    = len(pipeline.named_steps["nan_dropper"].cols_to_keep_)
-    n_clean   = len(pipeline.named_steps["corr_filter"].cols_to_keep_)
-    n_sel     = int(pipeline.named_steps["selector"].get_support().sum())
+    n_kept  = len(pipeline.named_steps["nan_dropper"].cols_to_keep_)
+    n_clean = len(pipeline.named_steps["corr_filter"].cols_to_keep_)
+    n_sel   = int(pipeline.named_steps["selector"].get_support().sum())
 
     log.info(f"\nTest AUC: {auc:.3f}  (95% CI {ci_lo:.3f}–{ci_hi:.3f})")
     log.info(f"Features after NaN/constant drop:  {n_kept}")
@@ -482,9 +575,12 @@ def train(X_tr: pd.DataFrame, y_tr: pd.Series,
 
     X_all = pd.concat([X_tr, X_te]).reset_index(drop=True)
     y_all = pd.concat([y_tr, y_te]).reset_index(drop=True)
-    cv    = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    cv_scores = cross_val_score(pipeline, X_all, y_all, cv=cv, scoring="roc_auc")
-    log.info(f"5-fold CV AUC: {cv_scores.mean():.3f} ± {cv_scores.std():.3f}")
+
+    # CV pipeline: probability=False skips Platt scaling on every fold
+    cv_pipeline = build_pipeline(probability=False)
+    cv          = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    cv_scores   = cross_val_score(cv_pipeline, X_all, y_all, cv=cv, scoring="roc_auc")
+    log.info(f"5-fold CV AUC (StratifiedKFold): {cv_scores.mean():.3f} ± {cv_scores.std():.3f}")
 
     return pipeline, auc, ci_lo, ci_hi, cv_scores
 
@@ -520,18 +616,15 @@ def compute_shap(pipeline, X_tr: pd.DataFrame, X_te: pd.DataFrame):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--limit",     type=int, default=None,
-                        help="Process only N scans (development speed-up)")
-    parser.add_argument("--skip-shap", action="store_true",
-                        help="Skip SHAP computation")
-    parser.add_argument("--demo",      action="store_true",
-                        help="Use synthetic labels if no annotations.csv found")
+    parser.add_argument("--limit",     type=int, default=None)
+    parser.add_argument("--skip-shap", action="store_true")
+    parser.add_argument("--demo",      action="store_true")
     parser.add_argument("--baselines", action="store_true",
                         help="Compute lung-volume and emphysema-fraction baselines "
                              "(requires reading all CT images; results cached)")
     args = parser.parse_args()
 
-    # 1. Feature extraction (from cache if available)
+    # 1. Features
     df = extract_all_features(limit=args.limit)
     if df.empty:
         log.error("No features extracted. Check subset directories and seg-lungs-LUNA16/.")
@@ -550,25 +643,30 @@ def main():
 
     log.info(f"\nDataset: {X_raw.shape[0]} samples × {X_raw.shape[1]} raw features")
 
-    # 3. Train/test split
-    # Cleaning (NaN drop, winsorize, correlation filter) is now INSIDE the
-    # pipeline, so it is fit only on the training fold — no test-set leakage.
+    # 3. Train/test split — cleaning is inside the pipeline (no leakage)
     X_tr, X_te, y_tr, y_te = train_test_split(
         X_raw, y, test_size=0.2, random_state=42, stratify=y
     )
+    # Track which series UIDs went to the test set (for baseline evaluation)
+    series_uids_te = series_uids[X_te.index].reset_index(drop=True)
+    y_te_reset     = y_te.reset_index(drop=True)
 
     # 4. Train
     pipeline, test_auc, ci_lo, ci_hi, cv_scores = train(X_tr, y_tr, X_te, y_te)
 
-    # 5. Spacing confound check (fast — reads .mhd headers only)
+    # 5. Spacing confound check (raw AUC — NOT flipped)
     spacing_aucs = check_spacing_confound(series_uids, y)
 
-    # 6. Baselines (optional; requires reading all CT images)
+    # 6. GroupKFold CV on binned spacing_z
+    group_cv = run_spacing_group_cv(X_raw, y, series_uids)
+
+    # 7. Baselines on the SAME test split as the model (n=36)
     baseline_aucs = {}
     if args.baselines:
-        baseline_aucs = compute_baselines(series_uids, y)
+        measurements  = compute_baseline_measurements(series_uids)
+        baseline_aucs = evaluate_baselines(measurements, series_uids_te, y_te_reset)
 
-    # 7. Random-label control (shuffled y, 5-fold CV on full dataset)
+    # 8. Random-label control (probability=False — no Platt scaling)
     log.info("\nRandom-label control (shuffled y)…")
     rng        = np.random.RandomState(42)
     y_shuffled = pd.Series(rng.permutation(y.values), index=y.index)
@@ -578,11 +676,10 @@ def main():
     )
     log.info(f"  Random-label CV AUC: {ctrl_scores.mean():.3f} ± {ctrl_scores.std():.3f}")
 
-    # 8. Feature-count comparison
-    cv5      = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    feat_cmp = compare_feature_counts(X_raw, y, cv5)
+    # 9. Feature-count comparison on same train/test split as main model
+    feat_cmp = compare_feature_counts(X_tr, y_tr, X_te, y_te)
 
-    # 9. Feature importance
+    # 10. Feature importance
     fi_dict = svc_feature_importance(pipeline)
     top5    = dict(sorted(fi_dict.items(), key=lambda x: abs(x[1]), reverse=True)[:5])
     log.info(
@@ -590,7 +687,7 @@ def main():
         "\n".join(f"  {k}: {v:+.4f}" for k, v in top5.items())
     )
 
-    # 10. Optional SHAP
+    # 11. Optional SHAP
     if not args.skip_shap and len(X_te) >= 5:
         shap_result = compute_shap(pipeline, X_tr, X_te)
         if shap_result:
@@ -599,9 +696,7 @@ def main():
             np.save(os.path.join(MODEL_DIR, "shap_values.npy"), sv)
             sample.to_csv(os.path.join(MODEL_DIR, "shap_sample.csv"), index=False)
 
-    # 11. Save artifacts
-    # feature_names stores ALL 75 raw feature names; the pipeline handles
-    # cleaning internally at inference time — no pre-cleaning step needed.
+    # 12. Save artifacts
     feature_names = list(X_raw.columns)
     joblib.dump(pipeline, os.path.join(MODEL_DIR, "lung_screener.pkl"))
 
@@ -613,8 +708,8 @@ def main():
 
     stats = {
         "test_auc":                  round(test_auc, 4),
-        "test_auc_ci_lo":            round(ci_lo,     4),
-        "test_auc_ci_hi":            round(ci_hi,     4),
+        "test_auc_ci_lo":            round(ci_lo,    4),
+        "test_auc_ci_hi":            round(ci_hi,    4),
         "cv_auc_mean":               round(float(cv_scores.mean()), 4),
         "cv_auc_std":                round(float(cv_scores.std()),  4),
         "n_train":                   len(X_tr),
@@ -624,6 +719,7 @@ def main():
         "random_label_cv_auc":       round(float(ctrl_scores.mean()), 4),
         "random_label_cv_std":       round(float(ctrl_scores.std()),  4),
         "spacing_confound":          spacing_aucs,
+        "group_cv":                  group_cv,
         "baseline_aucs":             baseline_aucs,
         "feature_count_comparison":  feat_cmp,
     }
@@ -633,7 +729,12 @@ def main():
     log.info(f"\n{'='*60}")
     log.info(f"  Model saved    →  model/lung_screener.pkl")
     log.info(f"  Test AUC       →  {test_auc:.3f}  (95% CI {ci_lo:.3f}–{ci_hi:.3f})")
-    log.info(f"  CV AUC         →  {cv_scores.mean():.3f} ± {cv_scores.std():.3f}")
+    log.info(f"  CV AUC (strat) →  {cv_scores.mean():.3f} ± {cv_scores.std():.3f}")
+    if group_cv:
+        log.info(
+            f"  CV AUC (group) →  {group_cv['mean']:.3f} ± {group_cv['std']:.3f}"
+            f"  ({group_cv['n_bins']} spacing bins)"
+        )
     log.info(f"  Random-label   →  {ctrl_scores.mean():.3f} ± {ctrl_scores.std():.3f}")
     log.info(f"{'='*60}")
     log.info("Next steps:")

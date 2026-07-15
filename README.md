@@ -32,7 +32,7 @@ Trained on **LUNA16 subsets 1–2** (178 CT scans, real nodule annotations).
 
 > **Note:** These are pre-fix numbers. The leakage fix (moving winsorization and correlation filtering inside the sklearn Pipeline so they are fitted on training data only) is expected to lower these metrics — that is the correct outcome, not a regression.
 
-Adding subset2 (89 → 178 scans) raised CV AUC from 0.601 to 0.708 and cut variance by nearly half (±0.187 → ±0.095), confirming the model is learning a real signal.
+Adding subset2 (89 → 178 scans) raised CV AUC from 0.601 to 0.708 and cut variance by nearly half (±0.187 → ±0.095). This is consistent with more data reducing estimation noise, but does not rule out an acquisition confound also becoming easier to learn — see the confound check results in `model/training_stats.json`.
 
 ---
 
@@ -243,6 +243,8 @@ Feature extraction results are cached to `features_cache_<params-hash>.csv`. Cha
 **LUNA16** (LUng Nodule Analysis 2016)
 888 CT scans from the LIDC-IDRI collection with standardised nodule annotations.
 Available at [luna16.grand-challenge.org](https://luna16.grand-challenge.org) — free registration required.
+
+**Important label semantics:** LUNA16 is a nodule *detection* benchmark. The label `1` means "this scan contains at least one confirmed pulmonary nodule ≥3 mm," not "this patient has cancer." LUNA16 carries no malignancy ratings. For malignancy scores, see the source LIDC-IDRI dataset, which includes radiologist malignancy ratings (1–5) per nodule.
 
 LUNA16 subsets are random cross-validation splits, not acquisition sites.
 
