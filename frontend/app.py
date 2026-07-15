@@ -29,7 +29,7 @@ st.set_page_config(
 st.title("Lung Disease Risk Screener")
 st.caption(
     "Radiomic feature extraction · Elastic Net + Linear SVM · "
-    "Based on Kirby et al. 2023"
+    "Radiomic feature extraction · Elastic Net + Linear SVM · LUNA16"
 )
 st.divider()
 
@@ -55,7 +55,7 @@ with st.sidebar:
         "Cleaning: outliers >2 SD removed, correlated features (r>0.90) dropped. "
         "Selection: **Elastic Net** regression (α=0.01, l₁=0.5). "
         "Classifier: **Linear SVM**. "
-        "\n\n*Kirby et al. 2023 — Radiomics for COPD risk stratification.*"
+        ""
     )
 
 # ── Upload panel ───────────────────────────────────────────────────────────────
@@ -144,6 +144,6 @@ if top_feats:
 st.divider()
 st.caption(
     "⚠️  **Research tool only — not for clinical use.**  "
-    "This model was trained on LUNA16 (subset1) and replicates Kirby et al. 2023 "
-    "for educational purposes. Consult a qualified radiologist for clinical decisions."
+    "This model was trained on LUNA16 CT scans. "
+    "Consult a qualified radiologist for clinical decisions."
 )

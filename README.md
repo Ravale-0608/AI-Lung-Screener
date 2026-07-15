@@ -1,6 +1,6 @@
 # Lung Disease Risk Screener
 
-A end-to-end medical imaging ML pipeline that classifies CT scans as high or low risk for lung disease using radiomic texture features. Replicates and extends the methodology of **Kirby et al. 2023** — the same feature sets, the same data cleaning rationale, and the same winning model combination.
+An end-to-end medical imaging ML pipeline that classifies CT scans as high or low risk for lung disease using radiomic texture features extracted from LUNA16 CT data.
 
 > **Research tool only — not for clinical use.**
 
@@ -65,7 +65,7 @@ PyRadiomics               ← extracts 75 texture features
   NGTDM ( 5)  Neighbourhood grey-tone difference matrix
     │
     ▼
-Data Cleaning             ← Kirby 2023 methodology
+Data Cleaning
   Winsorize ±2 SD         ← tame extreme values without losing samples
   Drop correlated (r>0.90)← 75 → 27 features
     │
@@ -83,15 +83,13 @@ Risk Score + Top Features ← 0–1 score, SVC coefficient contributions
 
 ## Methodology
 
-This project directly replicates **Kirby et al. 2023** (*Radiomics for COPD risk stratification from CT imaging*).
+**Feature extraction** uses PyRadiomics with 1mm isotropic resampling and binWidth=25. Five texture matrix classes are extracted: GLCM, GLRLM, GLSZM, GLDM, and NGTDM (75 features total).
 
-**Feature extraction** uses PyRadiomics with 1mm isotropic resampling and binWidth=25, matching the paper's preprocessing. The five texture matrix classes (GLCM, GLRLM, GLSZM, GLDM, NGTDM) are the same feature sets identified as most discriminative in the paper.
-
-**Data cleaning** follows the paper's pipeline: outlier values are winsorized to ±2 SD per feature, then highly correlated features (Pearson r > 0.90) are removed to reduce redundancy before model fitting.
+**Data cleaning**: outlier values are winsorized to ±2 SD per feature, then highly correlated features (Pearson r > 0.90) are removed to reduce redundancy before model fitting.
 
 **Feature selection** uses Elastic Net regression (α=0.01, L1 ratio=0.5) via `SelectFromModel`, treating the binary labels as continuous targets. The L1 penalty drives most coefficients to zero, selecting a sparse, interpretable feature subset.
 
-**Classification** uses a linear SVM trained on the Elastic Net-selected features. This is the combination the paper identifies as optimal — the SVM's linear decision boundary pairs well with the Elastic Net's pre-selected, low-redundancy features.
+**Classification** uses a linear SVM trained on the Elastic Net-selected features. The SVM's linear decision boundary pairs well with the Elastic Net's pre-selected, low-redundancy features.
 
 **Labels** are derived from LUNA16 `annotations.csv`: any scan with at least one confirmed nodule annotation is labelled high risk (1), otherwise low risk (0).
 
@@ -203,7 +201,7 @@ Upload a CT scan file (`.mhd`, `.nrrd`, `.nii`, `.nii.gz`).
     "glcm·ClusterTendency": -0.198,
     "ngtdm·Coarseness": 0.167
   },
-  "methodology": "Elastic Net feature selection + Linear SVM (Kirby et al. 2023)"
+  "methodology": "Elastic Net feature selection + Linear SVM"
 }
 ```
 
@@ -235,7 +233,7 @@ Feature extraction results are cached to `features_cache.csv`. Delete this file 
 
 - **More data** — add subsets 0 and 2–9 (~800 additional scans). This is the single change most likely to improve CV AUC.
 - **Nodule-specific ROIs** — extract features from spherical masks around each annotated nodule rather than the whole lung, closer to the paper's actual methodology.
-- **GLDZM features** — Kirby et al. report the grey-level distance-zone matrix alone achieves AUC 0.748. PyRadiomics supports it; it is not enabled here.
+- **GLDZM features** — the grey-level distance-zone matrix is not currently enabled; PyRadiomics supports it and adding it may improve AUC.
 - **Multi-site validation** — test on LIDC-IDRI to assess generalisation across scanners and acquisition protocols.
 - **Longitudinal model** — given two scans of the same patient, predict progression rather than point-in-time risk.
 
@@ -248,12 +246,6 @@ Feature extraction results are cached to `features_cache.csv`. Delete this file 
 Available at [luna16.grand-challenge.org](https://luna16.grand-challenge.org) — free registration required.
 
 The data is not included in this repository and must be downloaded separately. See the LUNA16 challenge page for terms of use.
-
----
-
-## Reference
-
-Kirby, J. et al. (2023). *Radiomic features for COPD risk stratification in CT imaging.* The methodology implemented here — texture feature extraction, Elastic Net feature selection, and Linear SVM classification — replicates the winning pipeline described in that work.
 
 ---
 

@@ -1,7 +1,7 @@
 """
 Lung Disease Risk Screener — Training Pipeline
-Replicates Kirby et al. 2023: radiomic feature extraction, Elastic Net
-feature selection, and Linear SVM classification on LUNA16 CT scans.
+Radiomic feature extraction, Elastic Net feature selection,
+and Linear SVM classification on LUNA16 CT scans.
 
 Usage:
     python Main.py                  # full run (slow — ~5–30 min/scan)
@@ -50,7 +50,7 @@ CANDIDATES_CSV  = os.path.join(BASE_DIR, "candidates.csv")
 
 os.makedirs(MODEL_DIR, exist_ok=True)
 
-#  PyRadiomics configuration (Kirby 2023 feature sets) 
+#  PyRadiomics configuration
 EXTRACTOR_PARAMS = {
     "imageType": {"Original": {}},
     "featureClass": {
@@ -195,7 +195,7 @@ def create_labels(df: pd.DataFrame, demo: bool = False) -> pd.DataFrame:
     return df
 
 
-#  Data cleaning (Kirby 2023 method) 
+#  Data cleaning
 
 def clean_features(X: pd.DataFrame):
     """
@@ -234,7 +234,7 @@ def train(X_train, y_train, X_test, y_test):
     """
     Elastic Net feature selection (treats labels as continuous 0/1 regression
     targets — drives sparse coefficients) followed by Linear SVM classifier.
-    This is the Kirby 2023 winning combination.
+    Elastic Net drives sparse feature selection; Linear SVM handles classification.
     """
     pipeline = Pipeline([
         ("scaler",   StandardScaler()),

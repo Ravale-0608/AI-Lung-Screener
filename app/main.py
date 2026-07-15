@@ -94,7 +94,7 @@ app = FastAPI(
     title="Lung Risk Screener API",
     description=(
         "COPD/nodule risk scoring from CT scans. "
-        "Replicates Kirby et al. 2023 — Elastic Net + Linear SVM."
+        "Elastic Net feature selection + Linear SVM on LUNA16 radiomic features."
     ),
     version="1.0.0",
     lifespan=lifespan,
@@ -263,5 +263,5 @@ async def predict(file: UploadFile = File(...)):
         "risk_score":   round(risk_score, 3),
         "risk_level":   risk_level,
         "top_features": top_feats,
-        "methodology":  "Elastic Net feature selection + Linear SVM (Kirby et al. 2023)",
+        "methodology":  "Elastic Net feature selection + Linear SVM",
     })
