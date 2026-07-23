@@ -29,7 +29,6 @@ import joblib
 from sklearn import set_config
 set_config(transform_output="pandas")
 
-from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.feature_selection import SelectFromModel
 from sklearn.linear_model import ElasticNet
 from sklearn.svm import SVC
@@ -40,6 +39,7 @@ from sklearn.model_selection import (
 )
 from sklearn.metrics import roc_auc_score, classification_report
 from radiomics import featureextractor
+from pipeline_steps import NaNDropper, Winsorizer, CorrelationFilter
 
 logging.basicConfig(
     level=logging.INFO,
@@ -82,76 +82,6 @@ _params_hash    = hashlib.md5(
 ).hexdigest()[:8]
 CACHE_CSV       = os.path.join(BASE_DIR, f"features_cache_{_params_hash}.csv")
 BASELINES_CACHE = os.path.join(BASE_DIR, "baselines_cache.csv")
-
-
-# ── Custom sklearn transformers ────────────────────────────────────────────────
-# All three are inside the Pipeline so fit() sees only the training fold.
-
-class NaNDropper(BaseEstimator, TransformerMixin):
-    """Drop features with any NaN/Inf or zero variance (fitted on train only)."""
-
-    def fit(self, X, y=None):
-        Xdf = pd.DataFrame(X) if not isinstance(X, pd.DataFrame) else X
-        bad = Xdf.replace([np.inf, -np.inf], np.nan).isna().any() | (Xdf.std() == 0)
-        self.cols_to_keep_ = Xdf.columns[~bad].tolist()
-        return self
-
-    def transform(self, X):
-        Xdf = pd.DataFrame(X) if not isinstance(X, pd.DataFrame) else X
-        return Xdf[self.cols_to_keep_]
-
-    def get_feature_names_out(self, input_features=None):
-        return np.array(self.cols_to_keep_)
-
-
-class Winsorizer(BaseEstimator, TransformerMixin):
-    """Clip feature values to ±n_std of the training distribution (fitted on train only)."""
-
-    def __init__(self, n_std=2):
-        self.n_std = n_std
-
-    def fit(self, X, y=None):
-        Xdf = pd.DataFrame(X) if not isinstance(X, pd.DataFrame) else X
-        self.mean_ = Xdf.mean()
-        self.std_  = Xdf.std()
-        return self
-
-    def transform(self, X):
-        Xdf = (
-            pd.DataFrame(X, columns=self.mean_.index)
-            if not isinstance(X, pd.DataFrame) else X
-        )
-        return Xdf.clip(
-            lower=self.mean_ - self.n_std * self.std_,
-            upper=self.mean_ + self.n_std * self.std_,
-            axis=1,
-        )
-
-    def get_feature_names_out(self, input_features=None):
-        return np.array(self.mean_.index.tolist())
-
-
-class CorrelationFilter(BaseEstimator, TransformerMixin):
-    """Drop features where |Pearson r| > threshold with any earlier feature (fitted on train only)."""
-
-    def __init__(self, threshold=0.90):
-        self.threshold = threshold
-
-    def fit(self, X, y=None):
-        Xdf = pd.DataFrame(X) if not isinstance(X, pd.DataFrame) else X
-        corr  = Xdf.corr().abs()
-        upper = corr.where(np.triu(np.ones(corr.shape, dtype=bool), k=1))
-        drop  = {c for c in upper.columns if upper[c].gt(self.threshold).any()}
-        self.cols_to_keep_ = [c for c in Xdf.columns if c not in drop]
-        self.n_dropped_    = len(drop)
-        return self
-
-    def transform(self, X):
-        Xdf = pd.DataFrame(X) if not isinstance(X, pd.DataFrame) else X
-        return Xdf[self.cols_to_keep_]
-
-    def get_feature_names_out(self, input_features=None):
-        return np.array(self.cols_to_keep_)
 
 
 def build_pipeline(max_features=None, threshold="mean", probability=False) -> Pipeline:

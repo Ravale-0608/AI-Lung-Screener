@@ -31,6 +31,9 @@ import joblib
 from sklearn import set_config
 set_config(transform_output="pandas")
 
+# Import custom transformers so joblib can resolve their class path when unpickling
+from pipeline_steps import NaNDropper, Winsorizer, CorrelationFilter  # noqa: F401
+
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
